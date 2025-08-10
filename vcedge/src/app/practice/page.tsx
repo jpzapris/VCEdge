@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "../../supabaseClient";
 
 type MCQ = {
@@ -13,20 +13,24 @@ type MCQ = {
   explanation: string;
 };
 
-const DEFAULT_SUBJECTS = [
-  "English",
-  "Mathematical Methods",
-  "Specialist Mathematics",
-  "Chemistry",
-  "Physics",
-  "Biology",
-  "Economics",
-  "Psychology",
-];
+const TOPICS: Record<string, string[]> = {
+  English: ["Language analysis", "Argument analysis", "Comparative"],
+  "Mathematical Methods": ["Functions", "Calculus", "Probability", "Algebra"],
+  "Specialist Mathematics": ["Complex numbers", "Vectors", "Matrices", "Mechanics"],
+  Chemistry: ["Stoichiometry", "Acids and bases", "Redox", "Organic"],
+  Physics: ["Kinematics", "Dynamics", "Electricity", "Waves"],
+  Biology: ["Cells", "Genetics", "Evolution", "Homeostasis"],
+  Economics: ["Microeconomics", "Macroeconomics", "Policy", "Markets"],
+  Psychology: ["Research methods", "Learning", "Memory", "Neuropsychology"],
+};
+
+const DEFAULT_SUBJECTS = Object.keys(TOPICS);
 
 export default function Practice() {
   const [subjects, setSubjects] = useState<string[]>(DEFAULT_SUBJECTS);
-  const [subject, setSubject] = useState<string>("English");
+  const [subject, setSubject] = useState<string>(DEFAULT_SUBJECTS[0]);
+  const [topic, setTopic] = useState<string>("Any topic");
+  const [difficulty, setDifficulty] = useState<number>(2); // adaptive
   const [q, setQ] = useState<MCQ | null>(null);
   const [sel, setSel] = useState<number | null>(null);
   const [reveal, setReveal] = useState(false);
@@ -34,7 +38,12 @@ export default function Practice() {
   const [status, setStatus] = useState<"ai" | "demo" | "">("");
   const startedAt = useRef<number>(Date.now());
 
-  // Load user subjects (if saved) then first question
+  const topicOptions = useMemo(
+    () => ["Any topic", ...(TOPICS[subject] ?? ["Core"])],
+    [subject]
+  );
+
+  // Load saved subjects (if any), then pull the first question
   useEffect(() => {
     (async () => {
       try {
@@ -46,17 +55,17 @@ export default function Practice() {
             .eq("id", user.id)
             .maybeSingle();
           if (prof?.subjects?.length) {
-            setSubjects(prof.subjects);
+            setSubjects(prof.subjects.filter((s: string) => TOPICS[s]) || DEFAULT_SUBJECTS);
             setSubject(prof.subjects[0]);
           }
         }
       } catch {/* ignore */}
-      await loadQ(subject);
+      await loadQ(subject, topic, difficulty);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function loadQ(subj: string) {
+  async function loadQ(subj: string, top: string, diff: number) {
     setLoading(true);
     setReveal(false);
     setSel(null);
@@ -67,11 +76,33 @@ export default function Practice() {
       method: "POST",
       cache: "no-store",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ subject: subj, difficulty: 2 }),
+      body: JSON.stringify({
+        subject: subj,
+        topic: top === "Any topic" ? undefined : top,
+        difficulty: diff,
+      }),
     });
 
+    // If API is in strict AI-only mode and errors, show a friendly message
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      const msg = j?.error || `Generator error (${r.status})`;
+      setQ({
+        subject: subj,
+        topic: top === "Any topic" ? undefined : top,
+        difficulty: diff,
+        question: `Generation failed: ${msg}. Check OPENAI_API_KEY and REQUIRE_AI env vars in Vercel.`,
+        options: ["Retry", "Retry", "Retry", "Retry"],
+        correctIndex: 0,
+        explanation: "This is a placeholder only due to upstream error.",
+      });
+      setStatus("");
+      setLoading(false);
+      return;
+    }
+
     const j = await r.json();
-    setStatus(j.source ?? "");
+    setStatus(j.source ?? "ai");
     setQ(j.question as MCQ);
     setLoading(false);
   }
@@ -88,7 +119,7 @@ export default function Practice() {
         body: JSON.stringify({
           subject: q.subject,
           topic: q.topic ?? null,
-          difficulty: q.difficulty,
+          difficulty,
           selectedIndex: sel,
           correctIndex: q.correctIndex,
           timeSeconds,
@@ -97,15 +128,33 @@ export default function Practice() {
     } catch {/* ignore */}
   }
 
+  async function nextQuestion(adaptFromCorrect: boolean) {
+    // Adaptive difficulty: +1 on correct, -1 on incorrect
+    const newDiff = Math.max(1, Math.min(5, difficulty + (adaptFromCorrect ? 1 : -1)));
+    setDifficulty(newDiff);
+    await loadQ(subject, topic, newDiff);
+  }
+
   if (loading && !q) return <p style={{ padding: 24 }}>Loading…</p>;
 
   return (
-    <main style={{ maxWidth: 780, margin: "40px auto", padding: 16 }}>
-      <header style={{ display: "flex", gap: 12, alignItems: "center", justifyContent: "space-between" }}>
+    <main style={{ maxWidth: 900, margin: "40px auto", padding: 16 }}>
+      <header
+        style={{
+          display: "grid",
+          gridTemplateColumns: "1fr auto auto auto",
+          gap: 12,
+          alignItems: "center",
+        }}
+      >
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <h1 style={{ margin: 0 }}>Practice</h1>
-          <small style={{ opacity: 0.6 }}>{status === "ai" ? "AI" : status === "demo" ? "Demo" : ""}</small>
+          <small style={{ opacity: 0.6 }}>
+            {status === "ai" ? "AI" : status === "demo" ? "Demo" : ""}
+          </small>
         </div>
+
+        {/* Subject selector */}
         <div>
           <label style={{ fontSize: 14, marginRight: 6 }}>Subject:</label>
           <select
@@ -113,12 +162,49 @@ export default function Practice() {
             onChange={async (e) => {
               const s = e.target.value;
               setSubject(s);
-              await loadQ(s);
+              setTopic("Any topic");
+              await loadQ(s, "Any topic", difficulty);
             }}
             style={{ padding: 6, borderRadius: 8 }}
           >
             {subjects.map((s) => (
               <option key={s} value={s}>{s}</option>
+            ))}
+          </select>
+        </div>
+
+        {/* Topic selector (changes with subject) */}
+        <div>
+          <label style={{ fontSize: 14, marginRight: 6 }}>Topic:</label>
+          <select
+            value={topic}
+            onChange={async (e) => {
+              const t = e.target.value;
+              setTopic(t);
+              await loadQ(subject, t, difficulty);
+            }}
+            style={{ padding: 6, borderRadius: 8 }}
+          >
+            {topicOptions.map((t) => (
+              <option key={t} value={t}>{t}</option>
+            ))}
+          </select>
+        </div>
+
+        {/* Difficulty (shows current adaptive level; editable too) */}
+        <div>
+          <label style={{ fontSize: 14, marginRight: 6 }}>Difficulty:</label>
+          <select
+            value={difficulty}
+            onChange={async (e) => {
+              const d = Number(e.target.value);
+              setDifficulty(d);
+              await loadQ(subject, topic, d);
+            }}
+            style={{ padding: 6, borderRadius: 8 }}
+          >
+            {[1,2,3,4,5].map((d)=>(
+              <option key={d} value={d}>{d}</option>
             ))}
           </select>
         </div>
@@ -163,7 +249,7 @@ export default function Practice() {
             <div style={{ marginTop: 16 }}>
               <p>
                 <b>
-                  {correct
+                  {sel !== null && sel === q.correctIndex
                     ? "Correct ✅"
                     : `Incorrect ❌ (Answer ${String.fromCharCode(65 + (q?.correctIndex ?? 0))})`}
                 </b>
@@ -174,18 +260,18 @@ export default function Practice() {
                 <button
                   onClick={async () => {
                     await recordAttempt();
-                    await loadQ(subject);
+                    await nextQuestion(sel !== null && sel === q.correctIndex);
                   }}
                   style={{ marginTop: 16, padding: "10px 16px", borderRadius: 12, border: "1px solid #000", cursor: "pointer" }}
                 >
-                  Next question
+                  Next question (adaptive)
                 </button>
+
                 <button
                   onClick={async () => {
-                    // skip logging; just regenerate
-                    await loadQ(subject);
+                    await loadQ(subject, topic, difficulty);
                   }}
-                  style={{ marginTop: 16, padding: "10px 16px", borderRadius: 12, border: "1px solid #aaa", cursor: "pointer", background: "#fafafa" }}
+                  style={{ marginTop: 16, padding: "10px 16px", borderRadius: 12, border: "1px solid #aaa", background: "#fafafa", cursor: "pointer" }}
                 >
                   Regenerate
                 </button>
@@ -197,3 +283,4 @@ export default function Practice() {
     </main>
   );
 }
+
